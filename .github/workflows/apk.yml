@@ -1,0 +1,78 @@
+name: Application Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/apk.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    name: Fabrication, essai et publication
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      MDP: mathos-essai
+      NUMERO: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clé de signature (créée une seule fois, gardée dans un brouillon privé du dépôt)
+        run: |
+          set -euo pipefail
+          CLES="$RUNNER_TEMP/mathos.keystore"
+          ID=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '[.[] | select(.draft and .tag_name == "cle-de-signature")][0].id // empty')
+          if [ -n "$ID" ]; then
+            AID=$(gh api "repos/$GITHUB_REPOSITORY/releases/$ID/assets" --jq '[.[] | select(.name == "mathos.keystore")][0].id // empty')
+            gh api -H 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$AID" > "$CLES"
+            echo "Clé existante reprise."
+          else
+            keytool -genkeypair -keystore "$CLES" -storetype PKCS12 -storepass "$MDP" -keypass "$MDP" -alias mathos -keyalg RSA -keysize 2048 -validity 10950 -dname "CN=MATHOS"
+            gh release create cle-de-signature "$CLES" --draft --title "NE PAS PUBLIER - clé de signature de l'application Android" --notes "Brouillon privé, visible seulement du propriétaire du dépôt. Il contient la clé qui signe l'application Android de MATHOS. Ne pas le publier, ne pas le supprimer : sans cette clé, une nouvelle version ne pourrait plus remplacer l'ancienne sur les téléphones."
+            echo "Clé créée."
+          fi
+          keytool -list -keystore "$CLES" -storepass "$MDP" | tail -3
+
+      - name: Fabrication
+        run: bash android/construire.sh "$RUNNER_TEMP/apk" "$NUMERO" "$RUNNER_TEMP/mathos.keystore" "$MDP"
+
+      - name: Accélération matérielle pour le téléphone simulé
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Essai sur un téléphone simulé
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: default
+          disable-animations: true
+          script: bash android/essai.sh "$RUNNER_TEMP/apk/MATHOS-essai.apk"
+
+      - name: Traces de l'essai
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: essai
+          path: |
+            journal.txt
+            apercu.png
+          if-no-files-found: ignore
+
+      - name: Publication
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/apk/MATHOS.apk" MATHOS.apk
+          gh release create "apk-0.2.$NUMERO" MATHOS.apk --latest --title "MATHOS pour Android, version 0.2 (fabrication n° $NUMERO)" --notes "Application Android de MATHOS, version d'essai. Elle contient la page du site et fonctionne sans connexion. Elle ne demande aucune permission et n'accède pas au réseau : les progrès restent sur le téléphone. Pour l'installer : ouvrir MATHOS.apk sur un téléphone Android 7 ou plus récent, puis accepter l'installation depuis cette source. Fabrication essayée automatiquement sur un téléphone simulé avant publication."
